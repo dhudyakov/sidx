@@ -1,6 +1,6 @@
 # Compiler configuration
-CXX      := g++
-CXXFLAGS := -std=c++23 -O3 -Wall -Wextra -march=graniterapids  -MMD -MP
+CXX      := g++-16
+CXXFLAGS := -std=c++26  -O3 -Wall -Wextra -march=graniterapids  -MMD -MP
 SDE      := ~/sde/sde64
 
 
