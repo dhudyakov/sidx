@@ -7,7 +7,6 @@
 #include <type_traits>
 #include <concepts>
 #include <utility>
-#include <immintrin.h>
 #include <simd>
 #include "key_storage.hpp"
 
@@ -51,62 +50,50 @@ public:
 private:
     KeyStorage<T, Size, Capacity> storage;
 
-    using IntType = std::tuple_element_t<std::countr_zero(sizeof(T)), std::tuple<int8_t, int16_t, int32_t, int64_t>>;
-    using MaskType = std::simd::mask<IntType>;
-
     static constexpr bool HasPadding = !std::has_unique_object_representations_v<T> && !std::is_floating_point_v<T>;
+    
 
 public:
     size_t find(T t) const
     {
-        using V = std::simd::vec<IntType>;
-        constexpr size_t Lanes = V::size();
-
+        using IntType = std::tuple_element_t<std::countr_zero(sizeof(T)), std::tuple<int8_t, int16_t, int32_t, int64_t>>;
+        using VecType = std::simd::vec<IntType>;
+        using MaskType = std::tuple_element_t<std::countr_zero(std::max<size_t>(VecType::size(), 8)) - 3, std::tuple<uint8_t, uint16_t, uint32_t, uint64_t>>;
+         
         if constexpr (HasPadding)
             __builtin_clear_padding(&t);
 
-        V v{std::bit_cast<IntType>(t)};
+        VecType v{std::bit_cast<IntType>(t)};
+    
+        auto compare = [&](size_t index) 
+        {
+            VecType chunk = std::simd::unchecked_load<VecType>(std::span{reinterpret_cast<const IntType *>(&storage[index]), VecType::size()});
+            return (chunk == v).to_ullong();
+        };
+        
+        constexpr size_t Lanes = VecType::size();
         size_t i = 0;
 
         for (; i + Lanes <= storage.size(); i += Lanes)
         {
-            V chunk = std::simd::unchecked_load<V>(std::span{reinterpret_cast<const IntType *>(&storage[i]), Lanes});
-            if (MaskType mask = (chunk == v); std::simd::any_of(mask))
-                return i + std::simd::reduce_min_index(mask);
+            if (MaskType mask = compare(i); mask)
+                return i + std::countr_zero(mask);  
         }
 
-        auto process_tail = [&](size_t index,uint64_t tail_mask)
-        {
-            V chunk = std::simd::unchecked_load<V>(std::span{reinterpret_cast<const IntType *>(&storage[index]), Lanes});
-            if (MaskType mask = (chunk == v) && MaskType{tail_mask}; std::simd::any_of(mask))
-                return index + std::simd::reduce_min_index(mask);
-            return storage.size();
-        };
         if constexpr (IsFixed)
         {
             if constexpr (Size % Lanes != 0)
             {
-                constexpr uint64_t bits = (1ULL << (Size % Lanes)) - 1ULL;
-                return process_tail(i, bits);
+                if (MaskType mask = compare(i) & (~0ULL >> (64 - (Size % Lanes))); mask)
+                    return i + std::countr_zero(mask);  
             }
         }
         else
         {
             if (i < storage.size())
             {
-                uint64_t bits = [](unsigned shift)
-                {
-                    if constexpr (sizeof(T) == 1)
-                    {
-                        return _bextr_u64(0xFFFFFFFFFFFFFFFFULL, 64 - shift, 64);
-                    }
-                    else
-                    {
-                        return _bextr_u32(0xFFFFFFFF, 32 - shift, 32);
-                    }
-                }(storage.size() - i);
-
-                return process_tail(i, bits);
+                if (MaskType mask = compare(i) & (~0ULL >> (64 - (storage.size() - i))); mask)
+                    return i + std::countr_zero(mask);  
             }
         }
         return storage.size();
