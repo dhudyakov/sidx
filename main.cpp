@@ -8,36 +8,29 @@
 #include <vector>
 #include <cstring>
 #include <concepts>
+#include <ranges>
+#include <flat_set>
+#include <meta>
 
 template <typename T>
-constexpr T make_scrambled_copy(T original, char scramble_pattern)
+void scramble(T& val, uint8_t seed)
 {
-    constexpr char KnownPattern = static_cast<char>(0xFF);
-    alignas(T) char mask_bytes[sizeof(T)];
-    for (std::size_t i = 0; i < sizeof(T); ++i)
-        mask_bytes[i] = KnownPattern;
-
-    __builtin_clear_padding(reinterpret_cast<T *>(mask_bytes));
-
-    for (std::size_t i = 0; i < sizeof(T); ++i)
-        mask_bytes[i] ^= KnownPattern;
-
-    T copy = original;
-    char *ptr = reinterpret_cast<char *>(&copy);
-    for (std::size_t i = 0; i < sizeof(T); ++i)
+    if constexpr (!std::has_unique_object_representations_v<T>)
     {
-        if (mask_bytes[i] == KnownPattern)
-            ptr[i] ^= scramble_pattern;
+        alignas(T) std::array<uint8_t, sizeof(T)> active_bits{};
+        active_bits.fill(0xFF);
+        __builtin_clear_padding(reinterpret_cast<T*>(active_bits.data()));
+
+        auto bytes = std::bit_cast<std::array<uint8_t, sizeof(T)>>(val);
+        for (std::size_t i = 0; i < sizeof(T); ++i)
+        {
+            uint8_t pad_mask = ~active_bits[i];
+            bytes[i] ^= static_cast<uint8_t>((seed + i * 31) & pad_mask);
+        }
+        val = std::bit_cast<T>(bytes);
     }
-    return copy;
 }
 
-struct Padded8
-{
-    char a;
-    int b;
-    bool operator==(const Padded8 &) const = default;
-};
 
 // -------------------------------------------------------------------------
 // Test Configuration 1: Pure Fixed-Size Static Layout Coverage
@@ -156,25 +149,152 @@ void test_dynamic_map()
 // -------------------------------------------------------------------------
 // Test Configuration 4: SIMD Matrix and Padding Validation
 // -------------------------------------------------------------------------
+template <std::size_t MinVal, std::size_t MaxVal, std::size_t Lanes>
+consteval auto make_boundary_sizes()
+{
+    std::flat_set<std::size_t> s;
+    for (std::size_t x : {MinVal, 1uz, 2uz, 3uz, Lanes > 1 ? Lanes - 1 : 1uz, Lanes, Lanes + 1, 2 * Lanes - 1, 2 * Lanes, MaxVal})
+        s.insert(std::clamp(x, MinVal, MaxVal));
+
+    return std::define_static_array(s);
+}
+
+template <typename T>
+void sweep_all_storage_modes(auto make_elem)
+{
+    constexpr std::size_t MaxCount = 128 / sizeof(T);
+    constexpr std::size_t Lanes = 64 / sizeof(T);
+
+    auto make_index = [&]<std::size_t N, std::size_t Cap = N>()
+    {
+        return [&]<std::size_t... Is>(std::index_sequence<Is...>)
+        {
+            return KeyIndex<T, N, Cap>(make_elem(Is)...);
+        }(std::make_index_sequence<N>{});
+    };
+
+    auto verify_contents = [&](const auto& index, std::size_t count)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            T query = make_elem(i);
+            if constexpr (!std::has_unique_object_representations_v<T>)
+                scramble(query, 0xA5 ^ i);
+
+            assert(index.find(query) == i);
+        }
+        assert(index.find(make_elem(count + 1)) == count);
+    };
+
+    // 1. Pure Fixed-Size Static Storage: KeyStorage<T, N, N> -> [1, MaxCount]
+    template for (constexpr auto N : make_boundary_sizes<1, MaxCount, Lanes>())
+    {
+        auto static_idx = make_index.template operator()<N>();
+        verify_contents(static_idx, N);
+    }
+
+    // 2. Hybrid Bounded Static Storage: KeyStorage<T, InitSize, MaxCount> -> [0, MaxCount - 1]
+    template for (constexpr auto N : make_boundary_sizes<0, MaxCount-1, Lanes>())
+    {
+        auto bounded_idx = make_index.template operator()<N, MaxCount>();
+        verify_contents(bounded_idx, N);
+
+        for (std::size_t n = N; n < MaxCount; ++n)
+        {
+            bounded_idx.emplace(make_elem(n));
+            verify_contents(bounded_idx, n + 1);
+        }
+    }
+
+    // 3. Dynamic Heap Storage: KeyStorage<T, 0, 0>
+    {
+        KeyIndex<T, 0, 0> dynamic_idx;
+        verify_contents(dynamic_idx, 0);
+
+        for (std::size_t n = 0; n < MaxCount; ++n)
+        {
+            dynamic_idx.emplace(make_elem(n));
+            verify_contents(dynamic_idx, n + 1);
+        }
+    }
+}
+
 void test_index_combinations()
 {
-    std::cout << "[Test 4] Sweeping FlatKeyIndex SIMD Combinations...\n";
+    std::cout << "[Test 4] Sweeping All KeyStorage Modes & Types up to 128 bytes...\n";
 
-    auto index_u8 = []<std::size_t... Is>(std::index_sequence<Is...>) 
+    template for (constexpr auto R : std::array{^^uint8_t, ^^uint16_t, ^^uint32_t, ^^uint64_t})
     {
-        return KeyIndex<uint8_t, 16>(static_cast<uint8_t>(Is + 5)...);
-    }(std::make_index_sequence<16>{});
+        using T = typename [:R:];
+        sweep_all_storage_modes<T>([](std::size_t i) -> T
+        {
+            return i * 7 + 1;
+        });
+    }
+    
+    struct Padded2
+    {
+        char a;
+        bool b;
+        Padded2() = default;
+        Padded2(std::size_t i) : a(i + 1), b((i & 1) == 0) {}
+    };
 
-    assert(index_u8.find(5) == 0);
-    assert(index_u8.find(20) == 15);
+    struct Padded4
+    {
+        char a;
+        short b;
+        Padded4() = default;
+        Padded4(std::size_t i) : a(i + 1), b(i & 0x7F) {}
+    };
 
-    Padded8 p1{'A', 100};
-    Padded8 p2 = make_scrambled_copy(p1, 0x5A);
+    struct Padded8
+    {
+        char a;
+        int b;
+        Padded8() = default;
+        Padded8(std::size_t i) : a(i + 1), b(i & 0x777F) {}
+    };
 
-    KeyIndex index_padded(p1, Padded8{'B', 200}, Padded8{'C', 300});
-    assert(index_padded.find(p2) == 0);
+    struct Bitfield2
+    {
+        uint8_t a;
+        uint8_t b : 1;
+        uint8_t   : 1; 
+        uint8_t c : 1;
+        uint8_t   : 1; 
+        uint8_t d : 1;
+        Bitfield2() = default;
+        Bitfield2(std::size_t i) : a(i + 1), b(i & 1), c((i >> 1) & 1), d((i >> 2) & 1) {}
+    };
 
-    std::cout << "-> SIMD Matrix and Padding Clearance swept successfully.\n\n";
+    struct Bitfield4
+    {
+        char a;
+        uint16_t b : 10;
+        Bitfield4() = default;
+        Bitfield4(std::size_t i) : a(i + 1), b(i % 1024) {}
+    };
+
+    struct Bitfield8
+    {
+        uint8_t a : 4;
+        uint32_t b : 20;
+        Bitfield8() = default;
+        Bitfield8(std::size_t i) : a(i + 1), b(i * 111) {}
+    };
+
+    template for (constexpr auto R : std::array{^^Padded2, ^^Padded4, ^^Padded8, ^^Bitfield2, ^^Bitfield4, ^^Bitfield8})
+    {
+        using T = typename [:R:];
+        sweep_all_storage_modes<T>([]<typename U = T>(std::size_t i) -> U
+        {
+            U v(i);
+            scramble(v, 0x5A ^ i);
+            return v;
+        });
+    }
+    std::cout << "-> All KeyStorage specializations and SIMD widths verified cleanly.\n\n";
 }
 
 int main()
